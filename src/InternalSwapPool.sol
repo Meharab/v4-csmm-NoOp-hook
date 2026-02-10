@@ -248,7 +248,7 @@ contract InternalSwapPool is BaseHook {
     
         // Calculate a percentage of the swap amount to capture as the fee. For this hook example we
         // will take 1% of the value that would be received.
-        _depositFees(
+        depositFees(
             key,
             params.zeroForOne ? swapFee : 0,
             !params.zeroForOne ? 0 : swapFee
