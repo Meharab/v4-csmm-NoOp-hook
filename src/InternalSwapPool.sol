@@ -28,6 +28,9 @@ import {BaseHook} from 'lib/v4-hooks-public/src/base/BaseHook.sol';
  *
  * The calculation of the fees paid into the {FeeCollector} should be undertaken by the
  * individual contracts that are calling it.
+ * 
+ * Within this contract we will capture tokens in afterSwap and HOLD them in this contract until
+ * we sell then to the user in the beforeSwap.
  */
 contract InternalSwapPool is BaseHook {
  
@@ -92,8 +95,47 @@ contract InternalSwapPool is BaseHook {
      * @param _amount1 The amount of currency1 to deposit
      */
     function depositFees(PoolKey calldata _poolKey, uint _amount0, uint _amount1) public {
-        _poolFees[_poolKey.toId()].amount0 += _amount0;
-        _poolFees[_poolKey.toId()].amount1 += _amount1;
+        PoolId poolId = _poolKey.toId();
+        _poolFees[poolId].amount0 += _amount0;
+        _poolFees[poolId].amount1 += _amount1;
+    }
+
+    /**
+     * Takes a collection address and, if there is sufficient fees available to
+     * claim, will call the `donate` function against the mapped Uniswap V4 pool.
+     *
+     * @dev This call could be checked in a Uniswap V4 interactions hook to
+     * dynamically process fees when they hit a threshold.
+     *
+     * @param _poolKey The PoolKey reference that will have fees distributed
+     */
+    function _distributeFees(PoolKey calldata _poolKey) internal {
+        // Get the amount of the native token available to donate
+        // Capture the amount of fees available to desrtibute
+        PoolId poolId = _poolKey.toId(); // bytes32
+        uint donateAmount = _poolFees[poolId].amount0;
+    
+        // Ensure that the collection has sufficient fees available
+        // Ensure that the fees have reached the desired threshold
+        if (donateAmount < DONATE_THRESHOLD_MIN) {
+            return; // don't want to revert because we are not interested in enforcing distribution at a certain threshold, just want to skip until we have enough fees to distribute
+        }
+        
+        // Make our donation to the pool
+        // Make a donation to the pool using the tokens
+        BalanceDelta delta = poolManager.donate(_poolKey, donateAmount, 0, '');
+    
+        // @todo We need to settle tokens here
+        // Check the native delta amounts that we need to transfer from the contract
+        // Settle the tokens that were donated
+        if (delta.amount0() < 0) {
+            _poolKey.currency0.settle(poolManager, address(this), uint(uint128(-delta.amount0())), false);
+        }
+    
+        // Reduce our available fees
+        // Reduce the available fees
+        //_poolFees[poolId].amount0 -= donateAmount;
+        _poolFees[poolId].amount0 = 0; // for saving gas
     }
  
     /**
@@ -118,7 +160,11 @@ contract InternalSwapPool is BaseHook {
         PoolKey calldata key, 
         SwapParams calldata params, 
         bytes calldata hookData
-    ) internal override returns (bytes4 selector_, BeforeSwapDelta beforeSwapDelta_, uint24 swapFee_) {
+    ) internal override returns (
+        bytes4 selector_, 
+        BeforeSwapDelta beforeSwapDelta_, 
+        uint24 swapFee_
+    ) {
         // Get the PoolId from the PoolKey
         PoolId poolId = key.toId();
     
@@ -127,7 +173,9 @@ contract InternalSwapPool is BaseHook {
         // impact against our pool.
     
         // We want to check if out token0 is the eth equivalent, or if it has swapped to token1
-        if (!params.zeroForOne && _poolFees[poolId].amount1 != 0) {
+        // 1. Swapping TOKEN for ETH
+        // 2. We have TOKEN fees stored inside the hook
+        if (params.zeroForOne && _poolFees[poolId].amount1 != 0) {
             // Capture the amount of tokens we will take, and the amount of ETH we will receive
             uint tokenIn;
             uint ethOut;
@@ -144,7 +192,9 @@ contract InternalSwapPool is BaseHook {
                 // Since we have an amount of token1 specified, we can determine the maximum
                 // amount that we can transact from our pool fees. We do this by taking the
                 // max value of either the pool token1 fees or the amount specified to swap for.
-                uint amountSpecified = (uint(params.amountSpecified) > _poolFees[poolId].amount1) ? _poolFees[poolId].amount1 : uint(params.amountSpecified);
+                uint amountSpecified = (uint(params.amountSpecified) > _poolFees[poolId].amount1) 
+                    ? _poolFees[poolId].amount1     // Partial fill
+                    : uint(params.amountSpecified); // NoOp call
     
                 // Capture the amount of ETH (token0) required at the current pool state to purchase
                 // the amount of token1 specified, capped by the pool fees available.
@@ -160,8 +210,8 @@ contract InternalSwapPool is BaseHook {
     
                 // Update our hook delta to reduce the upcoming swap amount to show that we have
                 // already spent some of the ETH and received some of the underlying ERC20.
-                // Specified = exact output (T)
-                // Unspecified = ETH
+                // Specified = exact output (T) -> -500 TOKEN
+                // Unspecified = ETH            -> +0.5 ETH
                 beforeSwapDelta_ = toBeforeSwapDelta(-int128(int(tokenIn)), int128(int(ethOut)));
             } else {
                 // ETH for token1 with Exact Input for Output (amountSpecified = negative value representing ETH):
@@ -214,9 +264,16 @@ contract InternalSwapPool is BaseHook {
             poolManager.take(key.currency0, address(this), ethOut);
             key.currency1.settle(poolManager, address(this), tokenIn, false);
         }
+
+        // Distribute fees to our LPs
+         _distributeFees(key);
     
         selector_ = IHooks.beforeSwap.selector;
     }
+
+    /**
+     * @dev This hook only assumes that fees will be registered as dynamic. You could expand this assumption to also be validated in the beforeInitialize hook, along with validating that currency0 is ETH!
+     */
  
     /**
      * Once a swap has been made, we distribute fees to our LPs and emit our price update event.
@@ -236,79 +293,104 @@ contract InternalSwapPool is BaseHook {
         SwapParams calldata params, 
         BalanceDelta delta, 
         bytes calldata hookData
-    ) internal override returns (bytes4 selector_, int128 hookDeltaUnspecified_) {
-        // Determine the currency that we will be taking our fee
-        Currency swapFeeCurrency = params.amountSpecified < 0 == params.zeroForOne ? key.currency1 : key.currency0;
+    ) internal override returns (
+        bytes4 selector_, 
+        int128 hookDeltaUnspecified_
+    ) {
+        // Determine the currency that we will be taking our fees from
+        // Currency swapFeeCurrency = params.amountSpecified < 0 == params.zeroForOne ? key.currency1 : key.currency0;
+        Currency unspecifiedCurrency = params.amountSpecified < 0 == params.zeroForOne ? key.currency1 : key.currency0;
     
         // Capture the amount received from the swap
         int128 swapAmount = params.amountSpecified < 0 == params.zeroForOne ? delta.amount1() : delta.amount0();
     
         // Calculate the swap fee and ensure it is a positive uint
-        uint swapFee = uint(uint128(swapAmount < 0 ? -swapAmount : swapAmount)) * 99 / 100;
+        // Take a swap fee from the swap amount and ensure it's positive
+        // @dev This will calculate 1% of the swapAmount (user receives 99%)
+        // uint swapFee = uint(uint128(swapAmount < 0 ? -swapAmount : swapAmount)) * 99 / 100;
+        uint swapFee = uint(uint128(swapAmount)) * 1 / 100;
     
         // Calculate a percentage of the swap amount to capture as the fee. For this hook example we
         // will take 1% of the value that would be received.
+        // Deposit the fees into our internal storage
         depositFees(
             key,
             params.zeroForOne ? swapFee : 0,
-            !params.zeroForOne ? 0 : swapFee
+            params.zeroForOne ? 0 : swapFee
         );
     
         // Take our swap fees from the {PoolManager}
-        swapFeeCurrency.take(poolManager, address(this), swapFee, false);
+        // Settle the fees against the PoolManager
+        //swapFeeCurrency.take(poolManager, address(this), swapFee, false);
+        unspecifiedCurrency.take(poolManager, address(this), swapFee, false);
     
         // Set our hookDelta to remove the amount of fees from the amount that the user will receive
+        // Set our hookDelta to remove the amount of fees from the returned amount
         hookDeltaUnspecified_ = -int128(int(swapFee));
     
         // Distribute fees to our LPs
-        _distributeFees(key);
+        // _distributeFees(key);
+
+        // Set our selector to make it work
         selector_ = IHooks.afterSwap.selector;
     }
- 
+
     /**
-     * Takes a collection address and, if there is sufficient fees available to
-     * claim, will call the `donate` function against the mapped Uniswap V4 pool.
-     *
-     * @dev This call could be checked in a Uniswap V4 interactions hook to
-     * dynamically process fees when they hit a threshold.
-     *
-     * @param _poolKey The PoolKey reference that will have fees distributed
+     * @dev You could also add this fee distribution to be triggered before liquidity is added or removed to ensure that LPs couldn't sneak in and claim pending fees!
      */
-    function _distributeFees(PoolKey calldata _poolKey) internal {
-        // Get the amount of the native token available to donate
-        PoolId poolId = _poolKey.toId();
-        uint donateAmount = _poolFees[poolId].amount0;
-    
-        // Ensure that the collection has sufficient fees available
-        if (donateAmount < DONATE_THRESHOLD_MIN) {
-            return;
-        }
-        
-        // Make our donation to the pool
-        BalanceDelta delta = poolManager.donate(_poolKey, donateAmount, 0, '');
-    
-        // @todo We need to settle tokens here
-        // Check the native delta amounts that we need to transfer from the contract
-        if (delta.amount0() < 0) {
-            _poolKey.currency0.settle(poolManager, address(this), uint(uint128(-delta.amount0())), false);
-        }
-    
-        // Reduce our available fees
-        _poolFees[poolId].amount0 -= donateAmount;
+
+    /**
+     * Before a liquidity position is modified, we distribute fees before they can come in to
+     * take a share of fees that they have not earned.
+     */
+    function _beforeAddLiquidity(
+        address sender, 
+        PoolKey calldata key, 
+        ModifyLiquidityParams calldata params, 
+        bytes calldata hookData
+    ) internal override returns (bytes4) {
+        // Distribute fees to our LPs
+        _distributeFees(key);
+
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
+    /**
+     * Before liquidity has been removed, we distribute fees.
+     *
+     * @param sender The initial msg.sender for the remove liquidity call
+     * @param key The key for the pool
+     * @param params The parameters for removing liquidity
+     * @param hookData Arbitrary data handed into the PoolManager by the liquidty provider to be be passed on to the hook
+     *
+     * @return selector_ The function selector for the hook
+     */
+    function _beforeRemoveLiquidity(
+        address sender, 
+        PoolKey calldata key, 
+        ModifyLiquidityParams calldata params, 
+        bytes calldata hookData
+    ) internal override returns (bytes4 selector_) {
+        // Distribute fees to our LPs
+        _distributeFees(key);
+
+        selector_ = IHooks.beforeRemoveLiquidity.selector;
     }
  
     /**
      * This function defines the hooks that are required, and also importantly those which are
      * not, by our contract. This output determines the contract address that the deployment
      * must conform to and is validated in the constructor of this contract.
+     * 
+     * @dev 0010 1011 0011 00
      */
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
-            beforeRemoveLiquidity: false,
+            beforeRemoveLiquidity: true,
             afterRemoveLiquidity: false,
             beforeSwap: true,
             afterSwap: true,
@@ -320,5 +402,7 @@ contract InternalSwapPool is BaseHook {
             afterRemoveLiquidityReturnDelta: false
         });
     }
- 
+/**
+ * @dev This functionality is just a stripped back implementation without any initial validation of the PoolKeys that will be registered. We could have some additional logic in which we validate that Currency0 is ETH and that the fees are dynamic, for example.
+ */
 }
